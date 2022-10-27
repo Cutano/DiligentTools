@@ -820,4 +820,219 @@ void ImGuiDiligentRenderer::RenderDrawData(IDeviceContext* pCtx, ImDrawData* pDr
     }
 }
 
+void ImGuiDiligentRenderer::RenderViewportDrawData(IDeviceContext* pCtx, ImDrawData* pDrawData, Uint32 RenderSurfaceWidth, Uint32 RenderSurfaceHeight, SURFACE_TRANSFORM SurfacePreTransform)
+{
+    // Avoid rendering when minimized
+    if (pDrawData->DisplaySize.x <= 0.0f || pDrawData->DisplaySize.y <= 0.0f)
+        return;
+
+    // Create and grow vertex/index buffers if needed
+    if (!m_pVB || static_cast<int>(m_VertexBufferSize) < pDrawData->TotalVtxCount)
+    {
+        m_pVB.Release();
+        while (static_cast<int>(m_VertexBufferSize) < pDrawData->TotalVtxCount)
+            m_VertexBufferSize *= 2;
+
+        BufferDesc VBDesc;
+        VBDesc.Name           = "Imgui vertex buffer";
+        VBDesc.BindFlags      = BIND_VERTEX_BUFFER;
+        VBDesc.Size           = m_VertexBufferSize * sizeof(ImDrawVert);
+        VBDesc.Usage          = USAGE_DYNAMIC;
+        VBDesc.CPUAccessFlags = CPU_ACCESS_WRITE;
+        m_pDevice->CreateBuffer(VBDesc, nullptr, &m_pVB);
+    }
+
+    if (!m_pIB || static_cast<int>(m_IndexBufferSize) < pDrawData->TotalIdxCount)
+    {
+        m_pIB.Release();
+        while (static_cast<int>(m_IndexBufferSize) < pDrawData->TotalIdxCount)
+            m_IndexBufferSize *= 2;
+
+        BufferDesc IBDesc;
+        IBDesc.Name           = "Imgui index buffer";
+        IBDesc.BindFlags      = BIND_INDEX_BUFFER;
+        IBDesc.Size           = m_IndexBufferSize * sizeof(ImDrawIdx);
+        IBDesc.Usage          = USAGE_DYNAMIC;
+        IBDesc.CPUAccessFlags = CPU_ACCESS_WRITE;
+        m_pDevice->CreateBuffer(IBDesc, nullptr, &m_pIB);
+    }
+
+    {
+        MapHelper<ImDrawVert> Verices(pCtx, m_pVB, MAP_WRITE, MAP_FLAG_DISCARD);
+        MapHelper<ImDrawIdx>  Indices(pCtx, m_pIB, MAP_WRITE, MAP_FLAG_DISCARD);
+
+        ImDrawVert* pVtxDst = Verices;
+        ImDrawIdx*  pIdxDst = Indices;
+        for (Int32 CmdListID = 0; CmdListID < pDrawData->CmdListsCount; CmdListID++)
+        {
+            const ImDrawList* pCmdList = pDrawData->CmdLists[CmdListID];
+            memcpy(pVtxDst, pCmdList->VtxBuffer.Data, pCmdList->VtxBuffer.Size * sizeof(ImDrawVert));
+            memcpy(pIdxDst, pCmdList->IdxBuffer.Data, pCmdList->IdxBuffer.Size * sizeof(ImDrawIdx));
+            pVtxDst += pCmdList->VtxBuffer.Size;
+            pIdxDst += pCmdList->IdxBuffer.Size;
+        }
+    }
+
+    // Setup orthographic projection matrix into our constant buffer
+    // Our visible imgui space lies from pDrawData->DisplayPos (top left) to pDrawData->DisplayPos+data_data->DisplaySize (bottom right).
+    // DisplayPos is (0,0) for single viewport apps.
+    {
+        // DisplaySize always refers to the logical dimensions that account for pre-transform, hence
+        // the aspect ratio will be correct after applying appropriate rotation.
+        float L = pDrawData->DisplayPos.x;
+        float R = pDrawData->DisplayPos.x + pDrawData->DisplaySize.x;
+        float T = pDrawData->DisplayPos.y;
+        float B = pDrawData->DisplayPos.y + pDrawData->DisplaySize.y;
+
+        // clang-format off
+        float4x4 Projection
+        {
+            2.0f / (R - L),                  0.0f,   0.0f,   0.0f,
+            0.0f,                  2.0f / (T - B),   0.0f,   0.0f,
+            0.0f,                            0.0f,   0.5f,   0.0f,
+            (R + L) / (L - R),  (T + B) / (B - T),   0.5f,   1.0f
+        };
+        // clang-format on
+
+        // Bake pre-transform into projection
+        switch (SurfacePreTransform)
+        {
+            case SURFACE_TRANSFORM_IDENTITY:
+                // Nothing to do
+                break;
+
+            case SURFACE_TRANSFORM_ROTATE_90:
+                // The image content is rotated 90 degrees clockwise.
+                Projection *= float4x4::RotationZ(-PI_F * 0.5f);
+                break;
+
+            case SURFACE_TRANSFORM_ROTATE_180:
+                // The image content is rotated 180 degrees clockwise.
+                Projection *= float4x4::RotationZ(-PI_F * 1.0f);
+                break;
+
+            case SURFACE_TRANSFORM_ROTATE_270:
+                // The image content is rotated 270 degrees clockwise.
+                Projection *= float4x4::RotationZ(-PI_F * 1.5f);
+                break;
+
+            case SURFACE_TRANSFORM_OPTIMAL:
+                UNEXPECTED("SURFACE_TRANSFORM_OPTIMAL is only valid as parameter during swap chain initialization.");
+                break;
+
+            case SURFACE_TRANSFORM_HORIZONTAL_MIRROR:
+            case SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90:
+            case SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180:
+            case SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270:
+                UNEXPECTED("Mirror transforms are not supported");
+                break;
+
+            default:
+                UNEXPECTED("Unknown transform");
+        }
+
+        MapHelper<float4x4> CBData(pCtx, m_pVertexConstantBuffer, MAP_WRITE, MAP_FLAG_DISCARD);
+        *CBData = Projection;
+    }
+
+    auto SetupRenderState = [&]() //
+    {
+        // Setup shader and vertex buffers
+        IBuffer* pVBs[] = {m_pVB};
+        pCtx->SetVertexBuffers(0, 1, pVBs, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+        pCtx->SetIndexBuffer(m_pIB, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+        pCtx->SetPipelineState(m_pPSO);
+
+        const float blend_factor[4] = {0.f, 0.f, 0.f, 0.f};
+        pCtx->SetBlendFactors(blend_factor);
+
+        Viewport vp;
+        vp.Width    = static_cast<float>(RenderSurfaceWidth) * pDrawData->FramebufferScale.x;
+        vp.Height   = static_cast<float>(RenderSurfaceHeight) * pDrawData->FramebufferScale.y;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        vp.TopLeftX = vp.TopLeftY = 0;
+        pCtx->SetViewports(1,
+                           &vp,
+                           static_cast<Uint32>(RenderSurfaceWidth * pDrawData->FramebufferScale.x),
+                           static_cast<Uint32>(RenderSurfaceHeight * pDrawData->FramebufferScale.y));
+    };
+
+    SetupRenderState();
+
+    // Render command lists
+    // (Because we merged all buffers into a single one, we maintain our own offset into them)
+    Uint32 GlobalIdxOffset = 0;
+    Uint32 GlobalVtxOffset = 0;
+
+    ITextureView* pLastTextureView = nullptr;
+    for (Int32 CmdListID = 0; CmdListID < pDrawData->CmdListsCount; CmdListID++)
+    {
+        const ImDrawList* pCmdList = pDrawData->CmdLists[CmdListID];
+        for (Int32 CmdID = 0; CmdID < pCmdList->CmdBuffer.Size; CmdID++)
+        {
+            const ImDrawCmd* pCmd = &pCmdList->CmdBuffer[CmdID];
+            if (pCmd->UserCallback != NULL)
+            {
+                // User callback, registered via ImDrawList::AddCallback()
+                // (ImDrawCallback_ResetRenderState is a special callback value used by the user to request the renderer to reset render state.)
+                if (pCmd->UserCallback == ImDrawCallback_ResetRenderState)
+                    SetupRenderState();
+                else
+                    pCmd->UserCallback(pCmdList, pCmd);
+            }
+            else
+            {
+                // Apply scissor/clipping rectangle
+                float4 ClipRect //
+                    {
+                        (pCmd->ClipRect.x - pDrawData->DisplayPos.x) * pDrawData->FramebufferScale.x,
+                        (pCmd->ClipRect.y - pDrawData->DisplayPos.y) * pDrawData->FramebufferScale.y,
+                        (pCmd->ClipRect.z - pDrawData->DisplayPos.x) * pDrawData->FramebufferScale.x,
+                        (pCmd->ClipRect.w - pDrawData->DisplayPos.y) * pDrawData->FramebufferScale.y //
+                    };
+                // Apply pretransform
+                ClipRect = TransformClipRect(pDrawData->DisplaySize, ClipRect);
+
+                Rect Scissor //
+                    {
+                        static_cast<Int32>(ClipRect.x),
+                        static_cast<Int32>(ClipRect.y),
+                        static_cast<Int32>(ClipRect.z),
+                        static_cast<Int32>(ClipRect.w) //
+                    };
+                pCtx->SetScissorRects(1,
+                                      &Scissor,
+                                      static_cast<Uint32>(RenderSurfaceWidth * pDrawData->FramebufferScale.x),
+                                      static_cast<Uint32>(RenderSurfaceHeight * pDrawData->FramebufferScale.y));
+
+                // Bind texture
+                auto* pTextureView = reinterpret_cast<ITextureView*>(pCmd->TextureId);
+                VERIFY_EXPR(pTextureView);
+                if (pTextureView != pLastTextureView)
+                {
+                    pLastTextureView = pTextureView;
+                    m_pTextureVar->Set(pTextureView);
+                    pCtx->CommitShaderResources(m_pSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+                }
+
+                DrawIndexedAttribs DrawAttrs{pCmd->ElemCount, sizeof(ImDrawIdx) == sizeof(Uint16) ? VT_UINT16 : VT_UINT32, DRAW_FLAG_VERIFY_STATES};
+                DrawAttrs.FirstIndexLocation = pCmd->IdxOffset + GlobalIdxOffset;
+                if (m_BaseVertexSupported)
+                {
+                    DrawAttrs.BaseVertex = pCmd->VtxOffset + GlobalVtxOffset;
+                }
+                else
+                {
+                    IBuffer* pVBs[]       = {m_pVB};
+                    Uint64   VtxOffsets[] = {sizeof(ImDrawVert) * (size_t{pCmd->VtxOffset} + size_t{GlobalVtxOffset})};
+                    pCtx->SetVertexBuffers(0, 1, pVBs, VtxOffsets, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_NONE);
+                }
+                pCtx->DrawIndexed(DrawAttrs);
+            }
+        }
+        GlobalIdxOffset += pCmdList->IdxBuffer.Size;
+        GlobalVtxOffset += pCmdList->VtxBuffer.Size;
+    }
+}
 } // namespace Diligent

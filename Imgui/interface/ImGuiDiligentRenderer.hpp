@@ -63,6 +63,10 @@ public:
                   SURFACE_TRANSFORM SurfacePreTransform);
     void EndFrame();
     void RenderDrawData(IDeviceContext* pCtx, ImDrawData* pDrawData);
+    void RenderViewportDrawData(IDeviceContext* pCtx, ImDrawData* pDrawData,
+                                Uint32            RenderSurfaceWidth,
+                                Uint32            RenderSurfaceHeight,
+                                SURFACE_TRANSFORM SurfacePreTransform);
     void InvalidateDeviceObjects();
     void CreateDeviceObjects();
     void CreateFontsTexture();
