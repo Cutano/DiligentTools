@@ -45,8 +45,6 @@ ImGuiImplDiligent::ImGuiImplDiligent(IRenderDevice* pDevice,
                                      Uint32         InitialIndexBufferSize)
 {
     ImGui::CreateContext();
-    ImGuiIO& io    = ImGui::GetIO();
-    io.IniFilename = nullptr;
     m_pRenderer.reset(new ImGuiDiligentRenderer(pDevice, BackBufferFmt, DepthBufferFmt, InitialVertexBufferSize, InitialIndexBufferSize));
 }
 
